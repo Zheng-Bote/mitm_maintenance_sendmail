@@ -27,6 +27,7 @@ Owns:
   @IPCClient
   @validateKEK
   @maskEmail
+  @ensureMailDir
 
 References:
   ../../collector-layer/collector_concept.md
@@ -37,7 +38,7 @@ Must:
   Report `status` and `audit` events via a nil-safe `@IPCClient` without writing directly to database log tables.
   Unwrap the active Data Encryption Key from `storage_keys` using the 32-byte KEK (AES-GCM, 12-byte nonce prefix) and decrypt the SMTP configuration from `source_credentials` (`config_payload`) for the configured `source_name`.
   Allow the CLI `mail_dir` argument to override `watch_dir` from `source_credentials`.
-  Report a `WARNING:` audit event if `mail_dir` or any processed `*.SendMail` file grants permissions to group or others (`perm & 0o077 != 0`).
+  Create the effective `mail_dir` (including missing parent directories) with mode `0700` if it does not exist; if it exists with permissions other than `0700`, emit a `WARNING:` audit event and set its mode to `0700`; report a `WARNING:` audit event for any processed `*.SendMail` file that grants permissions to group or others (`perm & 0o077 != 0`).
   Ignore `*.tmp` and `*.attempts` files when scanning `mail_dir`.
   Support both header-block `*.SendMail` files (`To`, optional `Cc`, `Subject`, optional `X-MitM-*` headers before the first empty line) and legacy `<recipient>.SendMail` files without a header block.
   Accept multiple comma-separated recipients in `To` and `Cc` and forward `X-MitM-*` headers unchanged into the outgoing MIME message.
@@ -61,6 +62,7 @@ Tasks:
   [x] #3 Add `build.sh`, `README.md`, `CHANGELOG.md`, `NOTICE`, and `.gitignore`.
   [x] #4 Implement Issue #1: header-block parsing (`To`, `Cc`, `Subject`, `X-MitM-*`), CR/LF validation, `.tmp` ignore, `.attempts` & `.failed` handling (`max_attempts`), permission checks, recipient masking, and outbox health reporting.
   [x] #5 Add unit tests for Issue #1 and update `README.md` and `CHANGELOG.md`.
+  [x] #6 Implement `@ensureMailDir` to create a missing `mail_dir` / `watch_dir` with mode `0700`, fix non-`0700` directory permissions, verify writability, and add unit tests.
 
 Done when:
   `go test ./...` passes and `build.sh` produces a static binary.

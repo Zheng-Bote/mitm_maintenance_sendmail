@@ -7,7 +7,7 @@
  *
  * @file main.go
  * @brief Scheduled CLI utility that dispatches *.SendMail files via SMTP using credentials decrypted from source_credentials.
- * @version 0.1.0
+ * @version 0.1.1
  * @date 2026-11-10
  *
  * @author ZHENG Robert (robert@hase-zheng.net)
@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"mime"
 	"net"
@@ -46,9 +47,12 @@ import (
 
 var (
 	appName          = "MitM Maintenance SendMail"
-	version          = "0.1.0"
+	version          = "0.1.1"
 	xMitmHeaderRegex = regexp.MustCompile(`^(?i)X-MitM-[A-Za-z0-9-]+$`)
 )
+
+// mailDirMode is the mode of the outbox: mail files are plaintext, only the scheduler user may access them.
+const mailDirMode fs.FileMode = 0o700
 
 const (
 	componentName      = "mitm_maintenance_sendmail"
@@ -958,23 +962,72 @@ func inspectOutbox(mailDir string, now time.Time) (int, int, time.Duration) {
 	return pending, failedFiles, oldestAge
 }
 
+// ensureMailDir makes sure the outbox exists as a directory with mode 0700 and is writable.
+// A missing directory (including missing parents) is created; another mode is corrected to 0700
+// (if that fails, e.g. for a directory of another owner, a warning is returned).
+func ensureMailDir(dir string) ([]string, error) {
+	where := describePath(dir)
+	var notes []string
+
+	info, err := os.Stat(dir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		if err := os.MkdirAll(dir, mailDirMode); err != nil {
+			return nil, fmt.Errorf("mail_dir %s does not exist and cannot be created: %w", where, err)
+		}
+		// MkdirAll applies the umask; set the mode explicitly.
+		if err := os.Chmod(dir, mailDirMode); err != nil {
+			return nil, fmt.Errorf("mail_dir %s was created, but its mode cannot be set to 0700: %w", where, err)
+		}
+		notes = append(notes, fmt.Sprintf("Created mail_dir %s with mode 0700", where))
+	case err != nil:
+		return nil, fmt.Errorf("mail_dir %s is not accessible: %w", where, err)
+	case !info.IsDir():
+		return nil, fmt.Errorf("mail_dir %s is not a directory", where)
+	case info.Mode().Perm() != mailDirMode:
+		if err := os.Chmod(dir, mailDirMode); err != nil {
+			notes = append(notes, fmt.Sprintf("WARNING: mail_dir %s has mode %04o instead of 0700 and its mode cannot be changed: %v",
+				where, info.Mode().Perm(), err))
+		} else {
+			notes = append(notes, fmt.Sprintf("WARNING: mail_dir %s had mode %04o; mode set to 0700", where, info.Mode().Perm()))
+		}
+	}
+
+	probe, err := os.CreateTemp(dir, ".write-check-*"+tempFileSuffix)
+	if err != nil {
+		return notes, fmt.Errorf("mail_dir %s is not writable: %w", where, err)
+	}
+	_ = probe.Close()
+	_ = os.Remove(probe.Name())
+	return notes, nil
+}
+
+// describePath quotes a path; a relative path is followed by its absolute path and the working directory.
+func describePath(path string) string {
+	if filepath.IsAbs(path) {
+		return fmt.Sprintf("%q", path)
+	}
+	abs, absErr := filepath.Abs(path)
+	cwd, cwdErr := os.Getwd()
+	if absErr != nil || cwdErr != nil {
+		return fmt.Sprintf("%q", path)
+	}
+	return fmt.Sprintf("%q (%s, working directory %s)", path, abs, cwd)
+}
+
 func processMailDir(ctx context.Context, mailDir, defaultSubject string, maxAttempts int, cfg SourceConfig, sendFn mailSenderFunc, ipc *IPCClient) (OutboxStats, error) {
 	var stats OutboxStats
 	if maxAttempts <= 0 {
 		maxAttempts = defaultMaxAttempts
 	}
 
-	info, err := os.Stat(mailDir)
+	notes, err := ensureMailDir(mailDir)
+	for _, note := range notes {
+		log.Println(note)
+		ipc.SendAudit(note)
+	}
 	if err != nil {
-		return stats, fmt.Errorf("Mail directory '%s' is not accessible: %w", mailDir, err)
-	}
-	if !info.IsDir() {
-		return stats, fmt.Errorf("Mail path '%s' is not a directory", mailDir)
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		msg := fmt.Sprintf("WARNING: Mail directory '%s' is accessible by group or others (mode %04o, expected 0700)", mailDir, info.Mode().Perm())
-		log.Println(msg)
-		ipc.SendAudit(msg)
+		return stats, err
 	}
 
 	entries, err := os.ReadDir(mailDir)

@@ -563,6 +563,14 @@ func TestProcessMailDir_PermissionWarnings(t *testing.T) {
 		t.Fatalf("processMailDir failed: %v", err)
 	}
 
+	dirInfo, err := os.Stat(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to stat tmpDir: %v", err)
+	}
+	if dirInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("expected mail_dir permissions to be corrected to 0700, got %04o", dirInfo.Mode().Perm())
+	}
+
 	warnings := 0
 	for _, ev := range getEvents() {
 		if strings.Contains(ev.Message, "WARNING:") {
@@ -571,6 +579,41 @@ func TestProcessMailDir_PermissionWarnings(t *testing.T) {
 	}
 	if warnings < 2 {
 		t.Fatalf("expected permission WARNING audit events for both directory and file, got %d", warnings)
+	}
+}
+
+func TestEnsureMailDir_CreatesMissingDirectoryWithMode0700(t *testing.T) {
+	missingDir := filepath.Join(t.TempDir(), "nested", "outbox")
+	ipc, getEvents := startMockIPCServer(t)
+
+	noopSender := func(_ context.Context, _ SourceConfig, _ ParsedMail) error {
+		return nil
+	}
+
+	if _, err := processMailDir(context.Background(), missingDir, defaultSubject, 5, SourceConfig{SMTPFrom: "noreply@example.com"}, noopSender, ipc); err != nil {
+		t.Fatalf("processMailDir failed to create missing mail_dir: %v", err)
+	}
+
+	info, err := os.Stat(missingDir)
+	if err != nil {
+		t.Fatalf("expected missingDir to be created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatal("expected created path to be a directory")
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("expected created directory to have mode 0700, got %04o", info.Mode().Perm())
+	}
+
+	foundCreatedAudit := false
+	for _, ev := range getEvents() {
+		if strings.Contains(ev.Message, "Created mail_dir") && strings.Contains(ev.Message, "0700") {
+			foundCreatedAudit = true
+			break
+		}
+	}
+	if !foundCreatedAudit {
+		t.Fatal("expected audit event confirming creation of mail_dir with mode 0700")
 	}
 }
 
