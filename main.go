@@ -34,6 +34,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,18 +45,23 @@ import (
 )
 
 var (
-	appName = "MitM Maintenance SendMail"
-	version = "0.1.0"
+	appName          = "MitM Maintenance SendMail"
+	version          = "0.1.0"
+	xMitmHeaderRegex = regexp.MustCompile(`^(?i)X-MitM-[A-Za-z0-9-]+$`)
 )
 
 const (
-	componentName  = "mitm_maintenance_sendmail"
-	defaultSource  = "SENDMAIL_SMTP"
-	defaultTopic   = "maintenance.sendmail"
-	defaultSubject = "New Message from SendMail"
-	defaultPort    = 587
-	mailFileSuffix = ".SendMail"
-	smtpTimeout    = 30 * time.Second
+	componentName      = "mitm_maintenance_sendmail"
+	defaultSource      = "SENDMAIL_SMTP"
+	defaultTopic       = "maintenance.sendmail"
+	defaultSubject     = "New Message from SendMail"
+	defaultPort        = 587
+	defaultMaxAttempts = 5
+	mailFileSuffix     = ".SendMail"
+	failedFileSuffix   = ".failed"
+	tempFileSuffix     = ".tmp"
+	attemptsFileSuffix = ".attempts"
+	smtpTimeout        = 30 * time.Second
 )
 
 // TargetDBConfig defines connection parameters for the MitM PostgreSQL database.
@@ -75,6 +81,7 @@ type SendMailArgs struct {
 	MailDir     string `json:"mail_dir"`
 	MailSubject string `json:"mail_subject"`
 	Topic       string `json:"topic"`
+	MaxAttempts int    `json:"max_attempts"`
 }
 
 // SourceConfig holds the decrypted SMTP configuration from source_credentials.config_payload.
@@ -86,6 +93,43 @@ type SourceConfig struct {
 	SMTPFrom     string `json:"smtp_from"`
 	SMTPStartTLS bool   `json:"smtp_starttls"`
 	WatchDir     string `json:"watch_dir"`
+}
+
+// ParsedMail represents a parsed *.SendMail file (either header-block or legacy format).
+type ParsedMail struct {
+	To           []string
+	Cc           []string
+	Subject      string
+	ExtraHeaders [][2]string
+	Body         string
+	HasHeader    bool
+}
+
+// OutboxStats summarizes a single run of processMailDir.
+type OutboxStats struct {
+	Sent             int
+	Failed           int
+	Pending          int
+	FailedFiles      int
+	OldestPendingAge time.Duration
+}
+
+// smtpConnectionError marks an unreachable SMTP server or failed TLS/Auth handshake (Req. 11).
+type smtpConnectionError struct {
+	err error
+}
+
+func (e *smtpConnectionError) Error() string {
+	return e.err.Error()
+}
+
+func (e *smtpConnectionError) Unwrap() error {
+	return e.err
+}
+
+func isSMTPConnectionError(err error) bool {
+	var target *smtpConnectionError
+	return errors.As(err, &target)
 }
 
 // StatusEvent represents a status or audit message sent to the scheduler Unix Domain Socket.
@@ -184,6 +228,46 @@ func fail(ipc *IPCClient, err error) error {
 	return err
 }
 
+// maskEmail masks an email address for logs and audit events (e.g. "ops@example.com" -> "o***@example.com").
+func maskEmail(addr string) string {
+	addr = strings.TrimSpace(addr)
+	atIdx := strings.IndexByte(addr, '@')
+	if atIdx <= 0 || atIdx == len(addr)-1 {
+		return "***"
+	}
+	localRunes := []rune(addr[:atIdx])
+	domain := addr[atIdx+1:]
+	return string(localRunes[0]) + "***@" + domain
+}
+
+func maskEmails(addrs []string) string {
+	if len(addrs) == 0 {
+		return ""
+	}
+	masked := make([]string, len(addrs))
+	for i, a := range addrs {
+		masked[i] = maskEmail(a)
+	}
+	return strings.Join(masked, ", ")
+}
+
+// maskFileName masks the filename prefix if it is a legacy email filename (e.g. "ops@example.com.SendMail" -> "o***@example.com.SendMail").
+func maskFileName(fileName string) string {
+	for _, suffix := range []string{mailFileSuffix, failedFileSuffix, attemptsFileSuffix, tempFileSuffix} {
+		if strings.HasSuffix(fileName, suffix) {
+			prefix := strings.TrimSuffix(fileName, suffix)
+			if strings.Contains(prefix, "@") {
+				return maskEmail(prefix) + suffix
+			}
+			return fileName
+		}
+	}
+	if strings.Contains(fileName, "@") {
+		return maskEmail(fileName)
+	}
+	return fileName
+}
+
 func validateKEK(masterKey string) ([]byte, error) {
 	if masterKey == "" {
 		return nil, fmt.Errorf("Missing MASTER_KEY environment variable")
@@ -207,6 +291,7 @@ func parseArgs(raw string) (SendMailArgs, error) {
 		SourceName:  defaultSource,
 		MailSubject: defaultSubject,
 		Topic:       defaultTopic,
+		MaxAttempts: defaultMaxAttempts,
 	}
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -227,6 +312,12 @@ func parseArgs(raw string) (SendMailArgs, error) {
 	}
 	if parsed.Topic != "" {
 		args.Topic = parsed.Topic
+	}
+	if parsed.MaxAttempts < 0 {
+		return SendMailArgs{}, fmt.Errorf("max_attempts must be positive, got %d", parsed.MaxAttempts)
+	}
+	if parsed.MaxAttempts > 0 {
+		args.MaxAttempts = parsed.MaxAttempts
 	}
 	return args, nil
 }
@@ -496,60 +587,257 @@ func isLocalhost(name string) bool {
 	return name == "localhost" || name == "127.0.0.1" || name == "::1"
 }
 
-func extractRecipient(fileName string) (string, bool) {
-	if !strings.HasSuffix(fileName, mailFileSuffix) {
-		return "", false
+func isValidEmail(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if addr == "" || strings.ContainsAny(addr, " \t\r\n<>") {
+		return false
 	}
-	recipient := strings.TrimSpace(strings.TrimSuffix(fileName, mailFileSuffix))
-	if recipient == "" || !strings.Contains(recipient, "@") {
-		return "", false
+	atIdx := strings.IndexByte(addr, '@')
+	if atIdx <= 0 || atIdx != strings.LastIndexByte(addr, '@') || atIdx == len(addr)-1 {
+		return false
 	}
-	return recipient, true
+	domain := addr[atIdx+1:]
+	return strings.Contains(domain, ".") && !strings.HasPrefix(domain, ".") && !strings.HasSuffix(domain, ".")
 }
 
-func buildMimeMessage(from, to, subject, body string) []byte {
-	cleanFrom := sanitizeHeader(from)
-	cleanTo := sanitizeHeader(to)
-	encodedSubject := mime.QEncoding.Encode("utf-8", sanitizeHeader(subject))
+func validateHeaderValue(val string) error {
+	for i := 0; i < len(val); i++ {
+		b := val[i]
+		if b == '\r' || b == '\n' {
+			return errors.New("header value contains CR/LF")
+		}
+		if (b < 0x20 && b != '\t') || b == 0x7f {
+			return fmt.Errorf("header value contains control character 0x%02x", b)
+		}
+	}
+	return nil
+}
 
-	normalizedBody := strings.ReplaceAll(body, "\r\n", "\n")
+func parseRecipientList(raw string) ([]string, error) {
+	parts := strings.Split(raw, ",")
+	var result []string
+	for _, part := range parts {
+		addr := strings.TrimSpace(part)
+		if addr == "" {
+			continue
+		}
+		if err := validateHeaderValue(addr); err != nil {
+			return nil, err
+		}
+		if !isValidEmail(addr) {
+			return nil, fmt.Errorf("invalid email address %q", maskEmail(addr))
+		}
+		result = append(result, addr)
+	}
+	return result, nil
+}
+
+func startsWithKnownHeader(firstLine string) bool {
+	colonIdx := strings.IndexByte(firstLine, ':')
+	if colonIdx <= 0 {
+		return false
+	}
+	name := strings.TrimSpace(firstLine[:colonIdx])
+	switch strings.ToLower(name) {
+	case "to", "cc", "subject":
+		return true
+	default:
+		return xMitmHeaderRegex.MatchString(name)
+	}
+}
+
+// parseMailFile parses a *.SendMail file as either a header-block mail or a legacy mail.
+func parseMailFile(fileName string, content []byte, defaultSubject string) (ParsedMail, error) {
+	if !strings.HasSuffix(fileName, mailFileSuffix) {
+		return ParsedMail{}, fmt.Errorf("unsupported file suffix for %q", maskFileName(fileName))
+	}
+	prefix := strings.TrimSpace(strings.TrimSuffix(fileName, mailFileSuffix))
+	text := string(content)
+
+	firstLine := text
+	if nlIdx := strings.IndexByte(text, '\n'); nlIdx >= 0 {
+		firstLine = strings.TrimSuffix(text[:nlIdx], "\r")
+	}
+
+	isHeaderFile := startsWithKnownHeader(firstLine) || !isValidEmail(prefix)
+	if !isHeaderFile {
+		if err := validateHeaderValue(defaultSubject); err != nil {
+			return ParsedMail{}, fmt.Errorf("invalid default subject: %w", err)
+		}
+		return ParsedMail{
+			To:        []string{prefix},
+			Subject:   defaultSubject,
+			Body:      text,
+			HasHeader: false,
+		}, nil
+	}
+
+	var parsed ParsedMail
+	parsed.HasHeader = true
+
+	// Split lines by \n and strip a single trailing \r from each header line; any remaining \r is a CR injection.
+	rest := text
+	foundBlankLine := false
+	for {
+		var line string
+		if nlIdx := strings.IndexByte(rest, '\n'); nlIdx >= 0 {
+			line = strings.TrimSuffix(rest[:nlIdx], "\r")
+			rest = rest[nlIdx+1:]
+		} else {
+			line = strings.TrimSuffix(rest, "\r")
+			rest = ""
+		}
+
+		if line == "" {
+			foundBlankLine = true
+			parsed.Body = rest
+			break
+		}
+
+		colonIdx := strings.IndexByte(line, ':')
+		if colonIdx <= 0 {
+			return ParsedMail{}, errors.New("malformed header line (missing colon)")
+		}
+		name := strings.TrimSpace(line[:colonIdx])
+		val := strings.TrimSpace(line[colonIdx+1:])
+
+		if err := validateHeaderValue(name); err != nil {
+			return ParsedMail{}, fmt.Errorf("invalid header name: %w", err)
+		}
+		if err := validateHeaderValue(val); err != nil {
+			return ParsedMail{}, fmt.Errorf("invalid header %q: %w", name, err)
+		}
+
+		switch strings.ToLower(name) {
+		case "to":
+			addrs, err := parseRecipientList(val)
+			if err != nil {
+				return ParsedMail{}, fmt.Errorf("invalid To header: %w", err)
+			}
+			parsed.To = append(parsed.To, addrs...)
+		case "cc":
+			addrs, err := parseRecipientList(val)
+			if err != nil {
+				return ParsedMail{}, fmt.Errorf("invalid Cc header: %w", err)
+			}
+			parsed.Cc = append(parsed.Cc, addrs...)
+		case "subject":
+			parsed.Subject = val
+		default:
+			if xMitmHeaderRegex.MatchString(name) {
+				parsed.ExtraHeaders = append(parsed.ExtraHeaders, [2]string{name, val})
+			}
+		}
+
+		if rest == "" {
+			break
+		}
+	}
+
+	if !foundBlankLine && len(parsed.To) == 0 && parsed.Subject == "" {
+		return ParsedMail{}, errors.New("missing header block separator")
+	}
+	if len(parsed.To) == 0 {
+		return ParsedMail{}, errors.New("missing valid To recipient in header block")
+	}
+	if strings.TrimSpace(parsed.Subject) == "" {
+		return ParsedMail{}, errors.New("missing Subject in header block")
+	}
+
+	return parsed, nil
+}
+
+func buildMimeMessage(from string, mail ParsedMail) ([]byte, error) {
+	if err := validateHeaderValue(from); err != nil {
+		return nil, fmt.Errorf("invalid From address: %w", err)
+	}
+	if err := validateHeaderValue(mail.Subject); err != nil {
+		return nil, fmt.Errorf("invalid Subject: %w", err)
+	}
+	for _, r := range mail.To {
+		if err := validateHeaderValue(r); err != nil {
+			return nil, fmt.Errorf("invalid To address: %w", err)
+		}
+	}
+	for _, r := range mail.Cc {
+		if err := validateHeaderValue(r); err != nil {
+			return nil, fmt.Errorf("invalid Cc address: %w", err)
+		}
+	}
+	for _, h := range mail.ExtraHeaders {
+		if !xMitmHeaderRegex.MatchString(h[0]) {
+			return nil, fmt.Errorf("invalid extra header name %q", h[0])
+		}
+		if err := validateHeaderValue(h[1]); err != nil {
+			return nil, fmt.Errorf("invalid header %q: %w", h[0], err)
+		}
+	}
+
+	encodedSubject := mime.QEncoding.Encode("utf-8", strings.TrimSpace(mail.Subject))
+	normalizedBody := strings.ReplaceAll(mail.Body, "\r\n", "\n")
 	normalizedBody = strings.ReplaceAll(normalizedBody, "\n", "\r\n")
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("From: <%s>\r\n", cleanFrom))
-	sb.WriteString(fmt.Sprintf("To: <%s>\r\n", cleanTo))
+	sb.WriteString(fmt.Sprintf("From: <%s>\r\n", strings.TrimSpace(from)))
+	sb.WriteString(fmt.Sprintf("To: %s\r\n", formatAddressHeader(mail.To)))
+	if len(mail.Cc) > 0 {
+		sb.WriteString(fmt.Sprintf("Cc: %s\r\n", formatAddressHeader(mail.Cc)))
+	}
 	sb.WriteString(fmt.Sprintf("Subject: %s\r\n", encodedSubject))
 	sb.WriteString(fmt.Sprintf("Date: %s\r\n", time.Now().UTC().Format(time.RFC1123Z)))
 	sb.WriteString("MIME-Version: 1.0\r\n")
 	sb.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
 	sb.WriteString("Content-Transfer-Encoding: 8bit\r\n")
+	for _, h := range mail.ExtraHeaders {
+		sb.WriteString(fmt.Sprintf("%s: %s\r\n", h[0], h[1]))
+	}
 	sb.WriteString("\r\n")
 	sb.WriteString(normalizedBody)
 	if !strings.HasSuffix(normalizedBody, "\r\n") {
 		sb.WriteString("\r\n")
 	}
-	return []byte(sb.String())
+	return []byte(sb.String()), nil
 }
 
-func sanitizeHeader(val string) string {
-	val = strings.ReplaceAll(val, "\r", "")
-	val = strings.ReplaceAll(val, "\n", "")
-	return strings.TrimSpace(val)
+func formatAddressHeader(addrs []string) string {
+	formatted := make([]string, len(addrs))
+	for i, a := range addrs {
+		formatted[i] = "<" + strings.TrimSpace(a) + ">"
+	}
+	return strings.Join(formatted, ", ")
 }
 
-func sendEmail(ctx context.Context, cfg SourceConfig, to, subject, body string) error {
+func uniqueRecipients(to, cc []string) []string {
+	seen := make(map[string]bool, len(to)+len(cc))
+	var all []string
+	for _, addr := range append(append([]string{}, to...), cc...) {
+		key := strings.ToLower(strings.TrimSpace(addr))
+		if key != "" && !seen[key] {
+			seen[key] = true
+			all = append(all, strings.TrimSpace(addr))
+		}
+	}
+	return all
+}
+
+func sendEmail(ctx context.Context, cfg SourceConfig, mail ParsedMail) error {
+	msg, err := buildMimeMessage(cfg.SMTPFrom, mail)
+	if err != nil {
+		return err
+	}
+
 	addr := net.JoinHostPort(cfg.SMTPServer, strconv.Itoa(cfg.SMTPPort))
 	dialer := &net.Dialer{Timeout: smtpTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return fmt.Errorf("failed to connect to SMTP server %s: %w", addr, err)
+		return &smtpConnectionError{err: fmt.Errorf("failed to connect to SMTP server %s: %w", addr, err)}
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(smtpTimeout))
 
 	client, err := smtp.NewClient(conn, cfg.SMTPServer)
 	if err != nil {
-		return fmt.Errorf("failed to create SMTP client: %w", err)
+		return &smtpConnectionError{err: fmt.Errorf("failed to create SMTP client: %w", err)}
 	}
 	defer client.Close()
 
@@ -559,7 +847,7 @@ func sendEmail(ctx context.Context, cfg SourceConfig, to, subject, body string) 
 			MinVersion: tls.VersionTLS12,
 		}
 		if err := client.StartTLS(tlsCfg); err != nil {
-			return fmt.Errorf("STARTTLS failed: %w", err)
+			return &smtpConnectionError{err: fmt.Errorf("STARTTLS failed: %w", err)}
 		}
 	}
 
@@ -571,22 +859,23 @@ func sendEmail(ctx context.Context, cfg SourceConfig, to, subject, body string) 
 			auth = smtp.PlainAuth("", cfg.SMTPUsername, cfg.SMTPPassword, cfg.SMTPServer)
 		}
 		if err := client.Auth(auth); err != nil {
-			return fmt.Errorf("SMTP authentication failed: %w", err)
+			return &smtpConnectionError{err: fmt.Errorf("SMTP authentication failed: %w", err)}
 		}
 	}
 
-	if err := client.Mail(sanitizeHeader(cfg.SMTPFrom)); err != nil {
+	if err := client.Mail(strings.TrimSpace(cfg.SMTPFrom)); err != nil {
 		return fmt.Errorf("MAIL FROM rejected: %w", err)
 	}
-	if err := client.Rcpt(sanitizeHeader(to)); err != nil {
-		return fmt.Errorf("RCPT TO rejected: %w", err)
+	for _, rcpt := range uniqueRecipients(mail.To, mail.Cc) {
+		if err := client.Rcpt(rcpt); err != nil {
+			return fmt.Errorf("RCPT TO rejected for %s: %w", maskEmail(rcpt), err)
+		}
 	}
 
 	wc, err := client.Data()
 	if err != nil {
 		return fmt.Errorf("DATA command failed: %w", err)
 	}
-	msg := buildMimeMessage(cfg.SMTPFrom, to, subject, body)
 	if _, err := wc.Write(msg); err != nil {
 		_ = wc.Close()
 		return fmt.Errorf("failed to write message body: %w", err)
@@ -598,20 +887,99 @@ func sendEmail(ctx context.Context, cfg SourceConfig, to, subject, body string) 
 	return client.Quit()
 }
 
-type mailSenderFunc func(ctx context.Context, cfg SourceConfig, to, subject, body string) error
+type mailSenderFunc func(ctx context.Context, cfg SourceConfig, mail ParsedMail) error
 
-func processMailDir(ctx context.Context, mailDir, subject string, cfg SourceConfig, sendFn mailSenderFunc, ipc *IPCClient) (int, int, error) {
+func attemptsFilePath(mailFilePath string) string {
+	base := strings.TrimSuffix(mailFilePath, mailFileSuffix)
+	return base + attemptsFileSuffix
+}
+
+func failedFilePath(mailFilePath string) string {
+	base := strings.TrimSuffix(mailFilePath, mailFileSuffix)
+	return base + failedFileSuffix
+}
+
+func readAttempts(mailFilePath string) int {
+	data, err := os.ReadFile(attemptsFilePath(mailFilePath))
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+func writeAttempts(mailFilePath string, attempts int) error {
+	return os.WriteFile(attemptsFilePath(mailFilePath), []byte(strconv.Itoa(attempts)+"\n"), 0o600)
+}
+
+func removeAttempts(mailFilePath string) {
+	_ = os.Remove(attemptsFilePath(mailFilePath))
+}
+
+func markFileFailed(mailFilePath string) error {
+	removeAttempts(mailFilePath)
+	return os.Rename(mailFilePath, failedFilePath(mailFilePath))
+}
+
+func inspectOutbox(mailDir string, now time.Time) (int, int, time.Duration) {
+	entries, err := os.ReadDir(mailDir)
+	if err != nil {
+		return 0, 0, 0
+	}
+	pending := 0
+	failedFiles := 0
+	var oldest time.Time
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		switch {
+		case strings.HasSuffix(name, mailFileSuffix):
+			pending++
+			if info, err := entry.Info(); err == nil {
+				if oldest.IsZero() || info.ModTime().Before(oldest) {
+					oldest = info.ModTime()
+				}
+			}
+		case strings.HasSuffix(name, failedFileSuffix):
+			failedFiles++
+		}
+	}
+
+	var oldestAge time.Duration
+	if !oldest.IsZero() && now.After(oldest) {
+		oldestAge = now.Sub(oldest).Round(time.Second)
+	}
+	return pending, failedFiles, oldestAge
+}
+
+func processMailDir(ctx context.Context, mailDir, defaultSubject string, maxAttempts int, cfg SourceConfig, sendFn mailSenderFunc, ipc *IPCClient) (OutboxStats, error) {
+	var stats OutboxStats
+	if maxAttempts <= 0 {
+		maxAttempts = defaultMaxAttempts
+	}
+
 	info, err := os.Stat(mailDir)
 	if err != nil {
-		return 0, 0, fmt.Errorf("Mail directory '%s' is not accessible: %w", mailDir, err)
+		return stats, fmt.Errorf("Mail directory '%s' is not accessible: %w", mailDir, err)
 	}
 	if !info.IsDir() {
-		return 0, 0, fmt.Errorf("Mail path '%s' is not a directory", mailDir)
+		return stats, fmt.Errorf("Mail path '%s' is not a directory", mailDir)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		msg := fmt.Sprintf("WARNING: Mail directory '%s' is accessible by group or others (mode %04o, expected 0700)", mailDir, info.Mode().Perm())
+		log.Println(msg)
+		ipc.SendAudit(msg)
 	}
 
 	entries, err := os.ReadDir(mailDir)
 	if err != nil {
-		return 0, 0, fmt.Errorf("Failed to read mail directory '%s': %w", mailDir, err)
+		return stats, fmt.Errorf("Failed to read mail directory '%s': %w", mailDir, err)
 	}
 
 	var fileNames []string
@@ -619,53 +987,88 @@ func processMailDir(ctx context.Context, mailDir, subject string, cfg SourceConf
 		if entry.IsDir() {
 			continue
 		}
-		if _, ok := extractRecipient(entry.Name()); ok {
-			fileNames = append(fileNames, entry.Name())
+		name := entry.Name()
+		if strings.HasSuffix(name, tempFileSuffix) || strings.HasSuffix(name, attemptsFileSuffix) || strings.HasSuffix(name, failedFileSuffix) {
+			continue
+		}
+		if strings.HasSuffix(name, mailFileSuffix) {
+			fileNames = append(fileNames, name)
 		}
 	}
 	sort.Strings(fileNames)
 
-	sentCount := 0
-	failedCount := 0
-
 	for _, fileName := range fileNames {
 		if err := ctx.Err(); err != nil {
-			return sentCount, failedCount, err
-		}
-
-		recipient, ok := extractRecipient(fileName)
-		if !ok {
-			continue
+			return stats, err
 		}
 
 		filePath := filepath.Join(mailDir, fileName)
+		maskedName := maskFileName(fileName)
+
+		if fInfo, err := os.Stat(filePath); err == nil && fInfo.Mode().Perm()&0o077 != 0 {
+			warnMsg := fmt.Sprintf("WARNING: Mail file '%s' is accessible by group or others (mode %04o, expected 0600)", maskedName, fInfo.Mode().Perm())
+			log.Println(warnMsg)
+			ipc.SendAudit(warnMsg)
+		}
+
 		content, err := os.ReadFile(filePath)
 		if err != nil {
-			log.Printf("Failed to read mail file '%s': %v", fileName, err)
-			ipc.SendAudit(fmt.Sprintf("Failed to read mail file '%s': %v", fileName, err))
-			failedCount++
+			errMsg := fmt.Sprintf("Failed to read mail file '%s': %v", maskedName, err)
+			log.Println(errMsg)
+			ipc.SendAudit("ERROR: " + errMsg)
+			stats.Failed++
 			continue
 		}
 
-		if err := sendFn(ctx, cfg, recipient, subject, string(content)); err != nil {
-			log.Printf("Failed to send email for '%s': %v", fileName, err)
-			ipc.SendAudit(fmt.Sprintf("Failed to send email to '%s': %v", recipient, err))
-			failedCount++
+		mail, err := parseMailFile(fileName, content, defaultSubject)
+		if err != nil {
+			_ = markFileFailed(filePath)
+			errMsg := fmt.Sprintf("Invalid mail file '%s' renamed to .failed: %v", maskedName, err)
+			log.Println(errMsg)
+			ipc.SendAudit("ERROR: " + errMsg)
+			stats.Failed++
 			continue
 		}
 
+		maskedRecipients := maskEmails(uniqueRecipients(mail.To, mail.Cc))
+		if err := sendFn(ctx, cfg, mail); err != nil {
+			if isSMTPConnectionError(err) {
+				return stats, err
+			}
+			attempts := readAttempts(filePath) + 1
+			stats.Failed++
+			if attempts >= maxAttempts {
+				_ = markFileFailed(filePath)
+				errMsg := fmt.Sprintf("Mail file '%s' (to %s) failed after %d attempts and was renamed to .failed: %v", maskedName, maskedRecipients, attempts, err)
+				log.Println(errMsg)
+				ipc.SendAudit("ERROR: " + errMsg)
+			} else {
+				_ = writeAttempts(filePath, attempts)
+				warnMsg := fmt.Sprintf("Failed to send mail file '%s' (to %s, attempt %d/%d): %v", maskedName, maskedRecipients, attempts, maxAttempts, err)
+				log.Println(warnMsg)
+				ipc.SendAudit(warnMsg)
+			}
+			continue
+		}
+
+		removeAttempts(filePath)
 		if err := os.Remove(filePath); err != nil {
-			log.Printf("Email sent to '%s', but failed to delete file '%s': %v", recipient, fileName, err)
-			ipc.SendAudit(fmt.Sprintf("Email sent to '%s', but failed to delete file '%s': %v", recipient, fileName, err))
-			failedCount++
+			errMsg := fmt.Sprintf("Email sent to %s, but failed to delete file '%s': %v", maskedRecipients, maskedName, err)
+			log.Println(errMsg)
+			ipc.SendAudit("ERROR: " + errMsg)
+			stats.Failed++
 			continue
 		}
 
-		sentCount++
-		ipc.SendAudit(fmt.Sprintf("Sent email to '%s' and deleted '%s'", recipient, fileName))
+		stats.Sent++
+		ipc.SendAudit(fmt.Sprintf("Sent email to %s and deleted '%s'", maskedRecipients, maskedName))
 	}
 
-	return sentCount, failedCount, nil
+	stats.Pending, stats.FailedFiles, stats.OldestPendingAge = inspectOutbox(mailDir, time.Now())
+	ipc.SendAudit(fmt.Sprintf("Outbox status for '%s': sent=%d, failed=%d, pending=%d, failed_files=%d, oldest_pending_age=%s",
+		mailDir, stats.Sent, stats.Failed, stats.Pending, stats.FailedFiles, stats.OldestPendingAge))
+
+	return stats, nil
 }
 
 func fetchCredentialsFromScheduler() (string, string, error) {
@@ -782,15 +1185,15 @@ func run(ctx context.Context) error {
 	mailDir := resolveMailDir(sourceCfg.WatchDir, args.MailDir)
 	ipc.SendEvent("processing", fmt.Sprintf("Scanning mail directory '%s'", mailDir), 50)
 
-	sentCount, failedCount, err := processMailDir(ctx, mailDir, args.MailSubject, sourceCfg, sendEmail, ipc)
+	stats, err := processMailDir(ctx, mailDir, args.MailSubject, args.MaxAttempts, sourceCfg, sendEmail, ipc)
 	if err != nil {
 		return fail(ipc, err)
 	}
 
 	ipc.SendEvent("processing", "Completed mail dispatch", 100)
-	ipc.SendAudit(fmt.Sprintf("Successfully sent %d emails from '%s' (Failed: %d)", sentCount, mailDir, failedCount))
 	ipc.SendAudit(fmt.Sprintf("%s (%s) finished", appName, version))
-	log.Printf("SendMail finished. Sent %d emails (Failed: %d).", sentCount, failedCount)
+	log.Printf("SendMail finished. Sent %d emails (Failed: %d, Pending: %d, FailedFiles: %d).",
+		stats.Sent, stats.Failed, stats.Pending, stats.FailedFiles)
 	return nil
 }
 
