@@ -1,0 +1,9 @@
+MitM Data Aggregator - Maintenance SendMail Job
+Copyright (c) 2026 ZHENG Robert
+
+This product includes software developed by ZHENG Robert (robert@hase-zheng.net).
+
+Third-party dependencies:
+- github.com/jackc/pgx/v5
+- golang.org/x/sync
+- golang.org/x/text

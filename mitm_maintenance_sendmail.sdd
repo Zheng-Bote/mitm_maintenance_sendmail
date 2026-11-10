@@ -1,0 +1,70 @@
+Spec: MitM Maintenance SendMail Job
+
+Platform: Go/Linux
+
+Purpose:
+  Scheduled CLI batch utility that scans a target directory for `*.SendMail` files, dispatches their contents as emails via SMTP using credentials decrypted from `source_credentials`, and deletes successfully sent files.
+
+Structure:
+  ./main.go: CLI entry point, IPC client, envelope decryption, file scanning, and SMTP dispatch
+  ./main_test.go: Unit tests for configuration, KEK validation, envelope decryption, file parsing, and SMTP auth
+  ./build.sh: Static binary build script
+
+Owns:
+  ./main.go
+  ./main_test.go
+  ./go.mod
+  ./go.sum
+  ./build.sh
+  ./README.md
+  ./CHANGELOG.md
+  ./NOTICE
+  ./.gitignore
+  @SendMailArgs
+  @SourceConfig
+  @TargetDBConfig
+  @IPCClient
+  @validateKEK
+
+References:
+  ../../collector-layer/collector_concept.md
+  ../../collector-layer/collector_creation_guide.md
+
+Must:
+  Fetch `MASTER_KEY` and `MITM_DB_CONFIG_JSON` from the scheduler Unix Domain Socket via `get_credentials` at startup, falling back to environment variables for standalone execution.
+  Report `status` and `audit` events via a nil-safe `@IPCClient` without writing directly to database log tables.
+  Unwrap the active Data Encryption Key from `storage_keys` using the 32-byte KEK (AES-GCM, 12-byte nonce prefix) and decrypt the SMTP configuration from `source_credentials` (`config_payload`) for the configured `source_name`.
+  Allow the CLI `mail_dir` argument to override `watch_dir` from `source_credentials`.
+  Process all regular files ending with `.SendMail` in the effective mail directory, extracting the recipient address from the filename prefix before `.SendMail` and using the UTF-8 file content as the message body.
+  Authenticate via SMTP (`AUTH LOGIN` / `PLAIN`) with optional `STARTTLS` as configured in `source_credentials`.
+  Delete a `.SendMail` file from disk only after its email has been transmitted without error.
+
+Must not:
+  Run a persistent filesystem watcher or daemon loop.
+  Write email payloads or cursors to `raw_ingestion` or `ingestion_cursors`.
+  Include plaintext passwords, keys, or email bodies in IPC events or log output.
+
+Accepts:
+  @SendMailArgs: JSON CLI argument in `os.Args[1]` with `source_name`, `mail_dir`, `mail_subject`, and `topic`
+
+Tasks:
+  [x] #1 Implement `main.go` with scheduler IPC, envelope decryption of `source_credentials`, `*.SendMail` processing, and SMTP transmission.
+  [x] #2 Implement unit tests in `main_test.go`.
+  [x] #3 Add `build.sh`, `README.md`, `CHANGELOG.md`, `NOTICE`, and `.gitignore`.
+
+Done when:
+  `go test ./...` passes and `build.sh` produces a static binary.
+
+Scenario: successful mail dispatch and file cleanup
+  Given a valid `recipient@example.com.SendMail` file exists in the configured mail directory
+  And active SMTP credentials for `source_name` are stored in `source_credentials`
+  When `mitm_maintenance_sendmail` is executed with JSON arguments
+  Then the email is sent to `recipient@example.com` with the configured subject and file content as body
+  And `recipient@example.com.SendMail` is deleted from the mail directory
+
+Scenario: failed SMTP transmission preserves file
+  Given a valid `recipient@example.com.SendMail` file exists in the configured mail directory
+  And the SMTP server rejects the transmission
+  When `mitm_maintenance_sendmail` is executed
+  Then `recipient@example.com.SendMail` is not deleted from disk
+  And the failure is counted and reported via `@IPCClient`

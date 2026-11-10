@@ -1,0 +1,70 @@
+name: update Markdown TOC
+
+# Author: Robert Zheng
+# created: 2026-04-15
+# updated: 2026-04-15
+# version: 1.0.0
+# description: update markdown table of contents
+
+run-name: update Markdown TOC by ${{ github.actor }}
+
+# Glob‑Support eg.: docs/**/*.md
+# MARKER_START = "<!-- START doctoc generated TOC please keep comment here to allow auto update -->"
+# MARKER_END = "<!-- END doctoc generated TOC please keep comment here to allow auto update -->"
+# SKIP_FLAG = "<!-- DOCTOC SKIP -->"
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      files:
+        description: "Comma-separated files or globs"
+        required: false
+        default: "./README.md, docs/**/*.md"
+      collapsed:
+        description: "true = collapsed <details>, false = expanded"
+        required: false
+        default: "true"
+
+permissions:
+  checks: write
+  contents: write
+
+jobs:
+  update-toc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && pip install glob2
+
+      - name: Run TOC updater
+        env:
+          FILES: ${{ github.event.inputs.files || github.event.inputs.files || './README.md' }}
+          COLLAPSED: ${{ github.event.inputs.collapsed || 'true' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python .github/actions/toc-action/insert_toc.py --files "$FILES" --collapsed "$COLLAPSED"
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: update Table of Contents"
+            git push
+          fi
