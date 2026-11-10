@@ -33,26 +33,33 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
+// startMockIPCServer starts a fake scheduler socket. getEvents returns every event sent so far:
+// IPCClient sends synchronously (dial, write, close), so when getEvents is called all connections
+// are already accepted or waiting in the listen backlog. stopServer first drains that backlog and
+// only then closes the listener; closing it right away would drop queued connections and their
+// events (flaky tests, mainly under -race).
 func startMockIPCServer(t *testing.T) (*IPCClient, func() []StatusEvent) {
 	t.Helper()
 	sockPath := filepath.Join(t.TempDir(), "scheduler.sock")
-	ln, err := net.Listen("unix", sockPath)
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: sockPath, Net: "unix"})
 	if err != nil {
 		t.Fatalf("failed to listen on unix socket: %v", err)
 	}
 
 	var (
-		mu       sync.Mutex
-		events   []StatusEvent
-		wg       sync.WaitGroup
-		closeOne sync.Once
+		mu         sync.Mutex
+		events     []StatusEvent
+		wg         sync.WaitGroup // connection handlers
+		acceptDone sync.WaitGroup // accept loop
+		closeOne   sync.Once
 	)
 
-	wg.Add(1)
+	acceptDone.Add(1)
 	go func() {
-		defer wg.Done()
+		defer acceptDone.Done()
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
@@ -77,6 +84,10 @@ func startMockIPCServer(t *testing.T) (*IPCClient, func() []StatusEvent) {
 
 	stopServer := func() {
 		closeOne.Do(func() {
+			// Accept() keeps returning queued connections and fails only once the backlog is
+			// empty and the deadline has passed; then the accept loop ends.
+			_ = ln.SetDeadline(time.Now().Add(100 * time.Millisecond))
+			acceptDone.Wait()
 			_ = ln.Close()
 			wg.Wait()
 		})
