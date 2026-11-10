@@ -5,15 +5,13 @@ All notable changes to the `mitm_maintenance_sendmail` component will be documen
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Fixed
-- Flaky unit tests (mainly with `-race`): the fake scheduler socket of the tests closed its listener while IPC connections were still waiting in the listen backlog, so audit events got lost (e.g. `TestProcessMailDir_PermissionWarnings` saw one instead of two warnings). The listener now drains the backlog before it is closed. Test code only.
-
 ## [v0.1.1] - 2026-11-10
 
 ### Changed
 - **Mail Directory Provisioning & Permissions**: `ensureMailDir` now automatically creates a missing `mail_dir` / `watch_dir` (including missing parent directories) with mode `0700`, corrects existing directory permissions that differ from `0700` (with a `WARNING:` audit event), and verifies writability before scanning.
+
+### Fixed
+- Flaky unit tests (mainly with `-race`): the fake scheduler socket of the tests closed its listener while IPC connections were still waiting in the listen backlog, so audit events got lost (e.g. `TestProcessMailDir_PermissionWarnings` saw one instead of two warnings). The listener now drains the backlog before it is closed. Test code only.
 
 ## [v0.1.0] - 2026-11-10
 
