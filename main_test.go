@@ -6,7 +6,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file main_test.go
- * @brief Unit tests for KEK validation, envelope decryption, configuration parsing, and mail directory processing.
+ * @brief Unit tests for KEK validation, envelope decryption, header/legacy parsing, retry/failed handling, masking, and IPC audit events.
  * @version 0.1.0
  * @date 2026-11-10
  *
@@ -18,18 +18,90 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
+
+func startMockIPCServer(t *testing.T) (*IPCClient, func() []StatusEvent) {
+	t.Helper()
+	sockPath := filepath.Join(t.TempDir(), "scheduler.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to listen on unix socket: %v", err)
+	}
+
+	var (
+		mu       sync.Mutex
+		events   []StatusEvent
+		wg       sync.WaitGroup
+		closeOne sync.Once
+	)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func(c net.Conn) {
+				defer wg.Done()
+				defer c.Close()
+				scanner := bufio.NewScanner(c)
+				for scanner.Scan() {
+					var ev StatusEvent
+					if err := json.Unmarshal(scanner.Bytes(), &ev); err == nil {
+						mu.Lock()
+						events = append(events, ev)
+						mu.Unlock()
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	stopServer := func() {
+		closeOne.Do(func() {
+			_ = ln.Close()
+			wg.Wait()
+		})
+	}
+	t.Cleanup(stopServer)
+
+	ipc := &IPCClient{
+		SocketPath: sockPath,
+		RunID:      42,
+		Component:  componentName,
+		Topic:      defaultTopic,
+		SourceName: defaultSource,
+	}
+
+	getEvents := func() []StatusEvent {
+		stopServer()
+		mu.Lock()
+		defer mu.Unlock()
+		out := make([]StatusEvent, len(events))
+		copy(out, events)
+		return out
+	}
+
+	return ipc, getEvents
+}
 
 func TestValidateKEK(t *testing.T) {
 	rawKey := "0123456789abcdef0123456789abcdef"
@@ -63,26 +135,28 @@ func TestParseArgs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error on empty args: %v", err)
 	}
-	if defaults.SourceName != defaultSource || defaults.MailSubject != defaultSubject || defaults.Topic != defaultTopic {
+	if defaults.SourceName != defaultSource || defaults.MailSubject != defaultSubject || defaults.Topic != defaultTopic || defaults.MaxAttempts != 5 {
 		t.Fatalf("unexpected defaults: %+v", defaults)
 	}
 
-	customJSON := `{"source_name":"NETCUP_SMTP","mail_dir":"/var/spool/sendmail","mail_subject":"System Alert","topic":"ops.mail"}`
+	customJSON := `{"source_name":"NETCUP_SMTP","mail_dir":"/var/spool/sendmail","mail_subject":"System Alert","topic":"ops.mail","max_attempts":3}`
 	custom, err := parseArgs(customJSON)
 	if err != nil {
 		t.Fatalf("unexpected error on custom args: %v", err)
 	}
-	if custom.SourceName != "NETCUP_SMTP" || custom.MailDir != "/var/spool/sendmail" || custom.MailSubject != "System Alert" || custom.Topic != "ops.mail" {
+	if custom.SourceName != "NETCUP_SMTP" || custom.MailDir != "/var/spool/sendmail" || custom.MailSubject != "System Alert" || custom.Topic != "ops.mail" || custom.MaxAttempts != 3 {
 		t.Fatalf("unexpected parsed args: %+v", custom)
 	}
 
+	if _, err := parseArgs(`{"max_attempts":-1}`); err == nil {
+		t.Fatal("expected error on negative max_attempts")
+	}
 	if _, err := parseArgs("{invalid-json"); err == nil {
 		t.Fatal("expected error on malformed JSON")
 	}
 }
 
 func TestParseSourceConfig(t *testing.T) {
-	// Native JSON types
 	nativeJSON := []byte(`{
 		"smtp_server": "digidocu-dev.netcup-mail.de",
 		"smtp_port": 587,
@@ -100,7 +174,6 @@ func TestParseSourceConfig(t *testing.T) {
 		t.Fatalf("unexpected parsed config: %+v", cfg)
 	}
 
-	// String-typed port and starttls (as in SendMail.env)
 	envStyleJSON := []byte(`{
 		"SMTP_SERVER": "digidocu-dev.netcup-mail.de",
 		"SMTP_PORT": "465",
@@ -129,14 +202,12 @@ func TestEnvelopeDecryptionRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Wrap DEK with KEK
 	kekBlock, _ := aes.NewCipher(kek)
 	kekGCM, _ := cipher.NewGCM(kekBlock)
 	dekNonce := make([]byte, 12)
 	_, _ = io.ReadFull(rand.Reader, dekNonce)
 	wrappedDEK := append(dekNonce, kekGCM.Seal(nil, dekNonce, dek, nil)...)
 
-	// Encrypt SourceConfig with DEK
 	dekBlock, _ := aes.NewCipher(dek)
 	dekGCM, _ := cipher.NewGCM(dekBlock)
 	cfgNonce := make([]byte, 12)
@@ -144,7 +215,6 @@ func TestEnvelopeDecryptionRoundTrip(t *testing.T) {
 	plaintext := []byte(`{"smtp_server":"smtp.example.org","smtp_port":587,"smtp_from":"noreply@example.org"}`)
 	ciphertext := dekGCM.Seal(nil, cfgNonce, plaintext, nil)
 
-	// Unwrap and decrypt
 	unwrappedDEK, err := unwrapDEK(kek, wrappedDEK)
 	if err != nil {
 		t.Fatalf("unwrapDEK failed: %v", err)
@@ -158,54 +228,338 @@ func TestEnvelopeDecryptionRoundTrip(t *testing.T) {
 	}
 }
 
-func TestProcessMailDir_SuccessAndFailure(t *testing.T) {
+func TestMaskEmailAndFileName(t *testing.T) {
+	if got := maskEmail("ops@example.com"); got != "o***@example.com" {
+		t.Fatalf("expected o***@example.com, got %q", got)
+	}
+	if got := maskEmail("a@example.com"); got != "a***@example.com" {
+		t.Fatalf("expected a***@example.com, got %q", got)
+	}
+	if got := maskEmail("invalid"); got != "***" {
+		t.Fatalf("expected ***, got %q", got)
+	}
+	if got := maskFileName("ops@example.com.SendMail"); got != "o***@example.com.SendMail" {
+		t.Fatalf("expected o***@example.com.SendMail, got %q", got)
+	}
+	if got := maskFileName("20261110T164259Z_3f2a9c.SendMail"); got != "20261110T164259Z_3f2a9c.SendMail" {
+		t.Fatalf("expected non-email filename to remain unchanged, got %q", got)
+	}
+}
+
+func TestParseMailFile_HeaderBlockAndLegacy(t *testing.T) {
+	headerContent := []byte(
+		"To: ops@example.com, admin@example.com\n" +
+			"Cc: security@example.com\n" +
+			"Subject: [MitM][ERROR] Job Collector mirror-dev Employee DE failed (RunID 3732)\n" +
+			"X-MitM-Severity: ERROR\n" +
+			"X-MitM-Source: program_runs/3732\n" +
+			"X-Unknown-Header: ignored-value\n" +
+			"\n" +
+			"Job:      Collector mirror-dev Employee DE\n" +
+			"Run:      3732, exit code 1\n",
+	)
+
+	parsed, err := parseMailFile("20261110T164259Z_3f2a9c.SendMail", headerContent, defaultSubject)
+	if err != nil {
+		t.Fatalf("unexpected error parsing header-block file: %v", err)
+	}
+	if !parsed.HasHeader {
+		t.Fatal("expected HasHeader=true")
+	}
+	if len(parsed.To) != 2 || parsed.To[0] != "ops@example.com" || parsed.To[1] != "admin@example.com" {
+		t.Fatalf("unexpected To: %+v", parsed.To)
+	}
+	if len(parsed.Cc) != 1 || parsed.Cc[0] != "security@example.com" {
+		t.Fatalf("unexpected Cc: %+v", parsed.Cc)
+	}
+	if parsed.Subject != "[MitM][ERROR] Job Collector mirror-dev Employee DE failed (RunID 3732)" {
+		t.Fatalf("unexpected Subject: %q", parsed.Subject)
+	}
+	if len(parsed.ExtraHeaders) != 2 || parsed.ExtraHeaders[0][0] != "X-MitM-Severity" || parsed.ExtraHeaders[1][0] != "X-MitM-Source" {
+		t.Fatalf("unexpected ExtraHeaders: %+v", parsed.ExtraHeaders)
+	}
+	if !strings.HasPrefix(parsed.Body, "Job:      Collector mirror-dev Employee DE\n") {
+		t.Fatalf("unexpected Body: %q", parsed.Body)
+	}
+
+	// Legacy file with a colon in the first body line must still be treated as legacy
+	legacyBody := []byte("Note: Server maintenance tonight\n\nDetails follow.")
+	legacy, err := parseMailFile("recipient@example.com.SendMail", legacyBody, "Custom Default Subject")
+	if err != nil {
+		t.Fatalf("unexpected error parsing legacy file: %v", err)
+	}
+	if legacy.HasHeader {
+		t.Fatal("expected HasHeader=false for legacy file")
+	}
+	if len(legacy.To) != 1 || legacy.To[0] != "recipient@example.com" || legacy.Subject != "Custom Default Subject" {
+		t.Fatalf("unexpected legacy parsed result: %+v", legacy)
+	}
+
+	// Header block missing Subject -> error
+	if _, err := parseMailFile("alert1.SendMail", []byte("To: ops@example.com\n\nBody"), defaultSubject); err == nil {
+		t.Fatal("expected error for missing Subject in header block")
+	}
+	// Header block missing To -> error
+	if _, err := parseMailFile("alert2.SendMail", []byte("Subject: Test\n\nBody"), defaultSubject); err == nil {
+		t.Fatal("expected error for missing To in header block")
+	}
+	// Header injection via embedded CR inside header value -> error
+	if _, err := parseMailFile("alert3.SendMail", []byte("To: ops@example.com\nSubject: Bad\rBcc: evil@example.com\n\nBody"), defaultSubject); err == nil {
+		t.Fatal("expected error for CR injection in header value")
+	}
+}
+
+func TestBuildMimeMessage_MultipleRecipientsAndXMitmHeaders(t *testing.T) {
+	mail := ParsedMail{
+		To:      []string{"ops@example.com", "admin@example.com"},
+		Cc:      []string{"security@example.com"},
+		Subject: "Test Subject",
+		ExtraHeaders: [][2]string{
+			{"X-MitM-Severity", "ERROR"},
+			{"X-MitM-Source", "program_runs/3732"},
+		},
+		Body: "Line 1\nLine 2",
+	}
+	raw, err := buildMimeMessage("sender@example.com", mail)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	msg := string(raw)
+	if !strings.Contains(msg, "From: <sender@example.com>\r\n") {
+		t.Fatalf("missing From header in %q", msg)
+	}
+	if !strings.Contains(msg, "To: <ops@example.com>, <admin@example.com>\r\n") {
+		t.Fatalf("missing To header in %q", msg)
+	}
+	if !strings.Contains(msg, "Cc: <security@example.com>\r\n") {
+		t.Fatalf("missing Cc header in %q", msg)
+	}
+	if !strings.Contains(msg, "X-MitM-Severity: ERROR\r\n") || !strings.Contains(msg, "X-MitM-Source: program_runs/3732\r\n") {
+		t.Fatalf("missing X-MitM-* headers in %q", msg)
+	}
+	if !strings.HasSuffix(msg, "\r\n\r\nLine 1\r\nLine 2\r\n") {
+		t.Fatalf("unexpected body formatting in %q", msg)
+	}
+
+	// Reject CR/LF in programmatic buildMimeMessage call
+	badMail := mail
+	badMail.Subject = "Injected\r\nBcc: attacker@example.com"
+	if _, err := buildMimeMessage("sender@example.com", badMail); err == nil {
+		t.Fatal("expected buildMimeMessage to reject CR/LF in Subject")
+	}
+}
+
+func TestProcessMailDir_HeaderLegacyTmpCollisionAndMasking(t *testing.T) {
 	tmpDir := t.TempDir()
-
-	okFile := filepath.Join(tmpDir, "alice@example.com.SendMail")
-	failFile := filepath.Join(tmpDir, "bob@example.com.SendMail")
-	ignoredFile := filepath.Join(tmpDir, "notes.txt")
-
-	if err := os.WriteFile(okFile, []byte("Hello Alice"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(failFile, []byte("Hello Bob"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(ignoredFile, []byte("Ignore me"), 0o600); err != nil {
+	if err := os.Chmod(tmpDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 
-	var dispatched []string
-	mockSender := func(_ context.Context, _ SourceConfig, to, subject, body string) error {
-		if to == "bob@example.com" {
-			return errors.New("simulated SMTP error")
+	ipc, getEvents := startMockIPCServer(t)
+
+	// 1 & 3. Two header-block files to the same recipient + Cc
+	file1 := filepath.Join(tmpDir, "20261110T164259Z_001.SendMail")
+	file2 := filepath.Join(tmpDir, "20261110T164300Z_002.SendMail")
+	// 2. Legacy file
+	legacyFile := filepath.Join(tmpDir, "legacy.user@example.com.SendMail")
+	// 4. .tmp file (must be ignored)
+	tmpFile := filepath.Join(tmpDir, "writing_in_progress.tmp")
+
+	content1 := "To: ops@example.com, admin@example.com\nCc: security@example.com\nSubject: Alert 1\nX-MitM-Severity: ERROR\n\nSecretBodyOne"
+	content2 := "To: ops@example.com\nSubject: Alert 2\n\nSecretBodyTwo"
+	legacyContent := "SecretLegacyBody"
+
+	for path, data := range map[string]string{
+		file1:      content1,
+		file2:      content2,
+		legacyFile: legacyContent,
+		tmpFile:    "To: ops@example.com\nSubject: Incomplete\n\nTmp",
+	} {
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
 		}
-		dispatched = append(dispatched, to+"|"+subject+"|"+body)
+	}
+
+	var sentMails []ParsedMail
+	mockSender := func(_ context.Context, _ SourceConfig, mail ParsedMail) error {
+		sentMails = append(sentMails, mail)
 		return nil
 	}
 
-	sent, failed, err := processMailDir(context.Background(), tmpDir, "Alert Subject", SourceConfig{SMTPFrom: "sender@example.com"}, mockSender, nil)
+	stats, err := processMailDir(context.Background(), tmpDir, defaultSubject, 5, SourceConfig{SMTPFrom: "noreply@example.com"}, mockSender, ipc)
 	if err != nil {
-		t.Fatalf("processMailDir returned unexpected error: %v", err)
+		t.Fatalf("processMailDir failed: %v", err)
 	}
-	if sent != 1 || failed != 1 {
-		t.Fatalf("expected sent=1, failed=1; got sent=%d, failed=%d", sent, failed)
+	if stats.Sent != 3 || stats.Failed != 0 || stats.Pending != 0 || stats.FailedFiles != 0 {
+		t.Fatalf("unexpected stats: %+v", stats)
 	}
-	if len(dispatched) != 1 || dispatched[0] != "alice@example.com|Alert Subject|Hello Alice" {
-		t.Fatalf("unexpected dispatched records: %+v", dispatched)
+	if len(sentMails) != 3 {
+		t.Fatalf("expected 3 sent mails, got %d", len(sentMails))
 	}
 
-	// alice@example.com.SendMail must be deleted
-	if _, err := os.Stat(okFile); !os.IsNotExist(err) {
-		t.Fatalf("expected %s to be deleted after successful send", okFile)
+	// Verify .tmp file was ignored and still exists
+	if _, err := os.Stat(tmpFile); err != nil {
+		t.Fatalf("expected .tmp file to be untouched: %v", err)
 	}
-	// bob@example.com.SendMail must remain on disk
-	if _, err := os.Stat(failFile); err != nil {
-		t.Fatalf("expected %s to be preserved after failed send: %v", failFile, err)
+
+	// Verify no unmasked recipient address or mail body appears in IPC events
+	events := getEvents()
+	if len(events) == 0 {
+		t.Fatal("expected IPC audit events to be recorded")
 	}
-	// notes.txt must remain untouched
-	if _, err := os.Stat(ignoredFile); err != nil {
-		t.Fatalf("expected %s to remain untouched: %v", ignoredFile, err)
+	foundOutboxStatus := false
+	for _, ev := range events {
+		for _, forbidden := range []string{
+			"ops@example.com",
+			"admin@example.com",
+			"security@example.com",
+			"legacy.user@example.com",
+			"SecretBodyOne",
+			"SecretBodyTwo",
+			"SecretLegacyBody",
+		} {
+			if strings.Contains(ev.Message, forbidden) {
+				t.Fatalf("IPC event leaked sensitive content %q in message: %q", forbidden, ev.Message)
+			}
+		}
+		if strings.Contains(ev.Message, "Outbox status for") {
+			foundOutboxStatus = true
+		}
+	}
+	if !foundOutboxStatus {
+		t.Fatal("expected final Outbox status audit event")
+	}
+}
+
+func TestProcessMailDir_MaxAttemptsAndFailedRename(t *testing.T) {
+	tmpDir := t.TempDir()
+	_ = os.Chmod(tmpDir, 0o700)
+
+	ipc, getEvents := startMockIPCServer(t)
+
+	mailFile := filepath.Join(tmpDir, "alert_retry.SendMail")
+	invalidHeaderFile := filepath.Join(tmpDir, "invalid_header.SendMail")
+
+	if err := os.WriteFile(mailFile, []byte("To: ops@example.com\nSubject: Retry Test\n\nBody"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Missing To: -> must be renamed to .failed immediately on first run
+	if err := os.WriteFile(invalidHeaderFile, []byte("Subject: Missing To\n\nBody"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	alwaysFailSender := func(_ context.Context, _ SourceConfig, _ ParsedMail) error {
+		return errors.New("550 mailbox unavailable")
+	}
+
+	// Run 1 (max_attempts = 3): invalid_header -> .failed immediately; alert_retry -> attempt 1/3
+	stats1, err := processMailDir(context.Background(), tmpDir, defaultSubject, 3, SourceConfig{SMTPFrom: "noreply@example.com"}, alwaysFailSender, ipc)
+	if err != nil {
+		t.Fatalf("run 1 failed: %v", err)
+	}
+	if stats1.Pending != 1 || stats1.FailedFiles != 1 {
+		t.Fatalf("expected pending=1, failed_files=1 after run 1; got %+v", stats1)
+	}
+	if got := readAttempts(mailFile); got != 1 {
+		t.Fatalf("expected 1 recorded attempt, got %d", got)
+	}
+
+	// Run 2: alert_retry -> attempt 2/3
+	stats2, err := processMailDir(context.Background(), tmpDir, defaultSubject, 3, SourceConfig{SMTPFrom: "noreply@example.com"}, alwaysFailSender, ipc)
+	if err != nil {
+		t.Fatalf("run 2 failed: %v", err)
+	}
+	if stats2.Pending != 1 || stats2.FailedFiles != 1 {
+		t.Fatalf("expected pending=1, failed_files=1 after run 2; got %+v", stats2)
+	}
+	if got := readAttempts(mailFile); got != 2 {
+		t.Fatalf("expected 2 recorded attempts, got %d", got)
+	}
+
+	// Run 3: alert_retry reaches max_attempts (3) -> renamed to alert_retry.failed, .attempts removed
+	stats3, err := processMailDir(context.Background(), tmpDir, defaultSubject, 3, SourceConfig{SMTPFrom: "noreply@example.com"}, alwaysFailSender, ipc)
+	if err != nil {
+		t.Fatalf("run 3 failed: %v", err)
+	}
+	if stats3.Pending != 0 || stats3.FailedFiles != 2 {
+		t.Fatalf("expected pending=0, failed_files=2 after run 3; got %+v", stats3)
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, "alert_retry.failed")); err != nil {
+		t.Fatalf("expected alert_retry.failed to exist: %v", err)
+	}
+	if _, err := os.Stat(attemptsFilePath(mailFile)); !os.IsNotExist(err) {
+		t.Fatal("expected .attempts sidecar file to be removed after renaming to .failed")
+	}
+
+	// Check that ERROR: audit events were emitted
+	errorAuditCount := 0
+	for _, ev := range getEvents() {
+		if strings.Contains(ev.Message, "ERROR:") {
+			errorAuditCount++
+		}
+	}
+	if errorAuditCount < 2 {
+		t.Fatalf("expected at least 2 ERROR: audit events, got %d", errorAuditCount)
+	}
+}
+
+func TestProcessMailDir_SMTPConnectionErrorDoesNotIncrementAttempts(t *testing.T) {
+	tmpDir := t.TempDir()
+	_ = os.Chmod(tmpDir, 0o700)
+
+	mailFile := filepath.Join(tmpDir, "alert_conn.SendMail")
+	if err := os.WriteFile(mailFile, []byte("To: ops@example.com\nSubject: Conn Test\n\nBody"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	connFailSender := func(_ context.Context, _ SourceConfig, _ ParsedMail) error {
+		return &smtpConnectionError{err: errors.New("dial tcp: connection refused")}
+	}
+
+	_, err := processMailDir(context.Background(), tmpDir, defaultSubject, 3, SourceConfig{SMTPFrom: "noreply@example.com"}, connFailSender, nil)
+	if err == nil || !isSMTPConnectionError(err) {
+		t.Fatalf("expected smtpConnectionError, got %v", err)
+	}
+	if got := readAttempts(mailFile); got != 0 {
+		t.Fatalf("expected attempts to remain 0 on SMTP connection error, got %d", got)
+	}
+	if _, statErr := os.Stat(mailFile); statErr != nil {
+		t.Fatalf("expected mail file to remain pending: %v", statErr)
+	}
+}
+
+func TestProcessMailDir_PermissionWarnings(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.Chmod(tmpDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ipc, getEvents := startMockIPCServer(t)
+
+	mailFile := filepath.Join(tmpDir, "perm_test.SendMail")
+	if err := os.WriteFile(mailFile, []byte("To: ops@example.com\nSubject: Perm Test\n\nBody"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(mailFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	noopSender := func(_ context.Context, _ SourceConfig, _ ParsedMail) error {
+		return nil
+	}
+
+	if _, err := processMailDir(context.Background(), tmpDir, defaultSubject, 5, SourceConfig{SMTPFrom: "noreply@example.com"}, noopSender, ipc); err != nil {
+		t.Fatalf("processMailDir failed: %v", err)
+	}
+
+	warnings := 0
+	for _, ev := range getEvents() {
+		if strings.Contains(ev.Message, "WARNING:") {
+			warnings++
+		}
+	}
+	if warnings < 2 {
+		t.Fatalf("expected permission WARNING audit events for both directory and file, got %d", warnings)
 	}
 }
 
@@ -218,21 +572,5 @@ func TestLoginAuth(t *testing.T) {
 	respPass, err := auth.Next([]byte("Password:"), true)
 	if err != nil || string(respPass) != "secret" {
 		t.Fatalf("unexpected password response: %q, err=%v", string(respPass), err)
-	}
-}
-
-func TestBuildMimeMessage(t *testing.T) {
-	msg := string(buildMimeMessage("admin@digidocu.dev", "user@example.com", "Test Subject", "Line 1\nLine 2"))
-	if !strings.Contains(msg, "From: <admin@digidocu.dev>\r\n") {
-		t.Fatalf("missing From header in %q", msg)
-	}
-	if !strings.Contains(msg, "To: <user@example.com>\r\n") {
-		t.Fatalf("missing To header in %q", msg)
-	}
-	if !strings.Contains(msg, "Subject: Test Subject\r\n") {
-		t.Fatalf("missing Subject header in %q", msg)
-	}
-	if !strings.HasSuffix(msg, "\r\n\r\nLine 1\r\nLine 2\r\n") {
-		t.Fatalf("unexpected body formatting in %q", msg)
 	}
 }
